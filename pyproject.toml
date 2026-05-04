@@ -1,0 +1,20 @@
+[project]
+name = "car-parking-system"
+version = "0.1.0"
+requires-python = ">=3.14"
+
+dependencies = [
+    "boto3",
+    "requests",
+]
+
+[dependency-groups]
+infra = [
+    "aws-cdk-lib>=2.100.0",
+    "constructs>=10.0.0",
+]
+dev = [
+    "pytest",
+    "moto[s3,dynamodb,sns,ssm]",
+    "responses",
+]
