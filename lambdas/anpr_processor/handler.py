@@ -1,30 +1,41 @@
 import json
+import logging
 import os
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from datetime import datetime, timezone, timedelta
 
 import boto3
 import requests
 
-s3 = boto3.client("s3")
-dynamodb = boto3.resource("dynamodb")
-ssm = boto3.client("ssm")
-sns = boto3.client("sns")
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 _api_key = None
-_confidence_threshold = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.7"))
-_vehicles_table = dynamodb.Table(os.environ.get("VEHICLES_TABLE", "parking-vehicles"))
-_events_table = dynamodb.Table(os.environ.get("EVENTS_TABLE", "parking-events"))
+_s3 = None
+_ssm = None
+_dynamodb = None
+_sns = None
+
+CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.7"))
+
+
+def _clients():
+    global _s3, _ssm, _dynamodb, _sns
+    if _s3 is None:
+        _s3 = boto3.client("s3")
+        _ssm = boto3.client("ssm")
+        _dynamodb = boto3.resource("dynamodb")
+        _sns = boto3.client("sns")
+    return _s3, _ssm, _dynamodb, _sns
 
 
 def _get_api_key():
     global _api_key
     if _api_key is None:
-        param = ssm.get_parameter(
-            Name=os.environ["PLATE_RECOGNIZER_API_KEY_PARAM"],
-            WithDecryption=True,
-        )
-        _api_key = param["Parameter"]["Value"]
+        _, ssm, _, _ = _clients()
+        param_name = os.environ["PLATE_RECOGNIZER_API_KEY_PARAM"]
+        response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+        _api_key = response["Parameter"]["Value"]
     return _api_key
 
 
@@ -34,44 +45,49 @@ def lambda_handler(event, context):
     lot_id = event["lot_id"]
     timestamp = event["timestamp"]
 
-    bucket = os.environ["CAPTURES_BUCKET"]
-    obj = s3.get_object(Bucket=bucket, Key=s3_key)
-    image_data = obj["Body"].read()
+    s3, _, dynamodb, sns = _clients()
+
+    s3_response = s3.get_object(Bucket=os.environ["CAPTURES_BUCKET"], Key=s3_key)
+    image_data = s3_response["Body"].read()
 
     api_key = _get_api_key()
+
     try:
-        response = requests.post(
+        pr_response = requests.post(
             "https://api.platerecognizer.com/v1/plate-reader/",
             headers={"Authorization": f"Token {api_key}"},
-            files={"upload": image_data},
+            files={"upload": ("image.jpg", image_data, "image/jpeg")},
             data={"regions": "nz"},
-            timeout=15,
+            timeout=10,
         )
-        response.raise_for_status()
-        pr_response = response.json()
-    except Exception as exc:
-        print(f"Plate Recognizer error: {exc}")
-        return {"statusCode": 500, "error": str(exc)}
+        pr_response.raise_for_status()
+        pr_data = pr_response.json()
+    except requests.HTTPError as e:
+        logger.error("plate_recognizer_error status=%s", e.response.status_code)
+        return {"statusCode": 500, "error": str(e)}
+    except Exception as e:
+        logger.error("plate_recognizer_error error=%s", str(e))
+        return {"statusCode": 500, "error": str(e)}
 
-    results = pr_response.get("results", [])
+    results = pr_data.get("results", [])
     if not results:
-        print("no_plate_detected")
-        return {"statusCode": 200, "status": "no_plate_detected"}
+        logger.info("no_plate_detected s3_key=%s", s3_key)
+        return {"statusCode": 200, "rego": None, "is_known": False}
 
-    best = max(results, key=lambda r: r.get("score", 0))
+    best = max(results, key=lambda r: r["score"])
     rego = best["plate"].upper()
     confidence = best["score"]
 
-    if confidence < _confidence_threshold:
-        print(f"low_confidence: {confidence}")
-        return {"statusCode": 200, "status": "low_confidence", "confidence": confidence}
+    if confidence < CONFIDENCE_THRESHOLD:
+        logger.info("low_confidence rego=%s confidence=%s", rego, confidence)
+        return {"statusCode": 200, "rego": rego, "is_known": False}
 
-    vehicle_resp = _vehicles_table.get_item(Key={"rego": rego})
-    vehicle = vehicle_resp.get("Item")
+    vehicles_table = dynamodb.Table(os.environ["VEHICLES_TABLE"])
+    vehicle_response = vehicles_table.get_item(Key={"rego": rego})
+    vehicle = vehicle_response.get("Item")
     is_known = vehicle is not None
 
-    now = datetime.now(timezone.utc)
-    expires_at = int((now + timedelta(days=90)).timestamp())
+    expires_at = int((datetime.now(timezone.utc) + timedelta(days=90)).timestamp())
 
     item = {
         "lot_id": lot_id,
@@ -81,10 +97,13 @@ def lambda_handler(event, context):
         "is_known": is_known,
         "s3_key": s3_key,
         "device_id": device_id,
-        "owner_name": vehicle.get("owner_name") if vehicle else None,
         "expires_at": expires_at,
     }
-    _events_table.put_item(Item=item)
+    if is_known and vehicle.get("owner_name"):
+        item["owner_name"] = vehicle["owner_name"]
+
+    events_table = dynamodb.Table(os.environ["EVENTS_TABLE"])
+    events_table.put_item(Item=item)
 
     if not is_known:
         sns.publish(

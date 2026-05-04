@@ -1,0 +1,4 @@
+pytest
+moto[s3,dynamodb,sns,ssm]
+responses
+boto3
