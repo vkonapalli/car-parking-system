@@ -62,13 +62,6 @@ class ParkingMonitoringStack(cdk.Stack):
 
         ssm.StringParameter(
             self,
-            "PlateRecognizerApiKeyParam",
-            parameter_name="/parking/plate-recognizer-api-key",
-            string_value="PLACEHOLDER",
-        )
-
-        ssm.StringParameter(
-            self,
             "SlackWebhookUrlParam",
             parameter_name="/parking/slack-webhook-url",
             string_value="PLACEHOLDER",
@@ -138,21 +131,18 @@ class ParkingMonitoringStack(cdk.Stack):
             role_arn=camera_s3_role.role_arn,
         )
 
-        anpr_processor = lambda_.Function(
+        anpr_processor = lambda_.DockerImageFunction(
             self,
             "AnprProcessor",
             function_name="anpr-processor",
-            runtime=lambda_.Runtime.PYTHON_3_12,
-            handler="handler.lambda_handler",
-            code=lambda_.Code.from_asset("../lambdas/anpr_processor"),
-            memory_size=256,
-            timeout=cdk.Duration.seconds(30),
+            code=lambda_.DockerImageCode.from_image_asset("../lambdas/anpr_processor"),
+            memory_size=512,
+            timeout=cdk.Duration.seconds(60),
             environment={
                 "CAPTURES_BUCKET": captures_bucket.bucket_name,
                 "VEHICLES_TABLE": vehicles_table.table_name,
                 "EVENTS_TABLE": events_table.table_name,
                 "SNS_TOPIC_ARN": unknown_vehicle_topic.topic_arn,
-                "PLATE_RECOGNIZER_API_KEY_PARAM": "/parking/plate-recognizer-api-key",
                 "CONFIDENCE_THRESHOLD": "0.7",
             },
         )
@@ -161,19 +151,6 @@ class ParkingMonitoringStack(cdk.Stack):
         vehicles_table.grant_read_write_data(anpr_processor)
         events_table.grant_read_write_data(anpr_processor)
         unknown_vehicle_topic.grant_publish(anpr_processor)
-        anpr_processor.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=["ssm:GetParameter"],
-                resources=[
-                    self.format_arn(
-                        service="ssm",
-                        resource="parameter",
-                        resource_name="parking/plate-recognizer-api-key",
-                    )
-                ],
-            )
-        )
-
         slack_notifier = lambda_.Function(
             self,
             "SlackNotifier",

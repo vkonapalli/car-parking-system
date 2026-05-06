@@ -5,14 +5,15 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import boto3
-import requests
+
+from .plate_detector import detect_plate
+from .ocr import read_plate
+from .plate_validator import process_plate
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-_api_key = None
 _s3 = None
-_ssm = None
 _dynamodb = None
 _sns = None
 
@@ -20,23 +21,12 @@ CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.7"))
 
 
 def _clients():
-    global _s3, _ssm, _dynamodb, _sns
+    global _s3, _dynamodb, _sns
     if _s3 is None:
         _s3 = boto3.client("s3")
-        _ssm = boto3.client("ssm")
         _dynamodb = boto3.resource("dynamodb")
         _sns = boto3.client("sns")
-    return _s3, _ssm, _dynamodb, _sns
-
-
-def _get_api_key():
-    global _api_key
-    if _api_key is None:
-        _, ssm, _, _ = _clients()
-        param_name = os.environ["PLATE_RECOGNIZER_API_KEY_PARAM"]
-        response = ssm.get_parameter(Name=param_name, WithDecryption=True)
-        _api_key = response["Parameter"]["Value"]
-    return _api_key
+    return _s3, _dynamodb, _sns
 
 
 def lambda_handler(event, context):
@@ -45,38 +35,27 @@ def lambda_handler(event, context):
     lot_id = event["lot_id"]
     timestamp = event["timestamp"]
 
-    s3, _, dynamodb, sns = _clients()
+    s3, dynamodb, sns = _clients()
 
     s3_response = s3.get_object(Bucket=os.environ["CAPTURES_BUCKET"], Key=s3_key)
     image_data = s3_response["Body"].read()
 
-    api_key = _get_api_key()
-
-    try:
-        pr_response = requests.post(
-            "https://api.platerecognizer.com/v1/plate-reader/",
-            headers={"Authorization": f"Token {api_key}"},
-            files={"upload": ("image.jpg", image_data, "image/jpeg")},
-            data={"regions": "nz"},
-            timeout=10,
-        )
-        pr_response.raise_for_status()
-        pr_data = pr_response.json()
-    except requests.HTTPError as e:
-        logger.error("plate_recognizer_error status=%s", e.response.status_code)
-        return {"statusCode": 500, "error": str(e)}
-    except Exception as e:
-        logger.error("plate_recognizer_error error=%s", str(e))
-        return {"statusCode": 500, "error": str(e)}
-
-    results = pr_data.get("results", [])
-    if not results:
-        logger.info("no_plate_detected s3_key=%s", s3_key)
+    plate_image = detect_plate(image_data)
+    if plate_image is None:
+        logger.info("no_plate_region s3_key=%s", s3_key)
         return {"statusCode": 200, "rego": None, "is_known": False}
 
-    best = max(results, key=lambda r: r["score"])
-    rego = best["plate"].upper()
-    confidence = best["score"]
+    raw_text, ocr_confidence = read_plate(plate_image)
+    if not raw_text:
+        logger.info("no_text_detected s3_key=%s", s3_key)
+        return {"statusCode": 200, "rego": None, "is_known": False}
+
+    rego, confidence = process_plate(raw_text, ocr_confidence)
+    if rego is None:
+        logger.info("no_valid_plate s3_key=%s", s3_key)
+        return {"statusCode": 200, "rego": None, "is_known": False}
+
+    logger.info("plate_read rego=%s confidence=%.2f raw=%s", rego, confidence, raw_text)
 
     if confidence < CONFIDENCE_THRESHOLD:
         logger.info("low_confidence rego=%s confidence=%s", rego, confidence)

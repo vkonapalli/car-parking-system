@@ -1,2 +1,19 @@
 [tools]
 python = "3.14"
+
+[tasks.setup]
+description = "Install system dependencies and sync Python packages"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v tesseract &> /dev/null; then
+  echo "Installing tesseract via Homebrew..."
+  brew install tesseract
+else
+  echo "tesseract already installed: $(tesseract --version 2>&1 | head -1)"
+fi
+
+echo "Syncing Python dependencies..."
+uv sync --group dev
+"""
