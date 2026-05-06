@@ -5,7 +5,9 @@ requires-python = ">=3.14"
 
 dependencies = [
     "boto3",
-    "requests",
+    "opencv-python-headless",
+    "pytesseract",
+    "numpy",
 ]
 
 [dependency-groups]
@@ -16,5 +18,4 @@ infra = [
 dev = [
     "pytest",
     "moto[s3,dynamodb,sns,ssm]",
-    "responses",
 ]
